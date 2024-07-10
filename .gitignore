@@ -1,0 +1,20 @@
+*.pth
+*.pth.*
+*.so
+build
+__pycache__
+.idea
+*/venv
+.DS_Store
+*.egg-info*
+.vscode
+
+# Downloaded testing data
+3PhData.tar.gz
+DataTrn.txt
+DataTrnLbls.txt
+
+
+# Training and visualizing
+model_viz
+model_training
