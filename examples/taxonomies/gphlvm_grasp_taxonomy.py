@@ -200,7 +200,7 @@ def main(latent_dim, model_type, loss_type='Zero', loss_scale=0.0, plot_on=True,
 
 if __name__ == '__main__':
     parser = ArgumentParser()
-    parser.add_argument("--latent_dim", dest="latent_dim", type=int, default=3,
+    parser.add_argument("--latent_dim", dest="latent_dim", type=int, default=2,
                         help="Set the latent dim (H2 -> 2, H3 -> 3).")
     parser.add_argument("--model_type", dest="model_type", default="BC",
                         help="Set the model type. Options: MAP, BC.")
@@ -209,7 +209,7 @@ if __name__ == '__main__':
     parser.add_argument("--loss_scale", dest="loss_scale", type=float, default=3000.0,
                         help="Set the loss scale.")
     parser.add_argument("--load_on", dest="load_on", type=bool, default=False,
-                        help="If True, generate plots.")
+                        help="If True, load existing model.")
     parser.add_argument("--plot_on", dest="plot_on", type=bool, default=True,
                         help="If True, generate plots.")
 

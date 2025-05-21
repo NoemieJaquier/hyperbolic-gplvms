@@ -11,8 +11,14 @@ from gpytorch.kernels import ScaleKernel, Kernel
 from geoopt.manifolds import Lorentz
 from geoopt import ManifoldParameter
 
+import geometric_kernels.torch
+from geometric_kernels.spaces import Hyperbolic
+from geometric_kernels.kernels.feature_map import MaternFeatureMapKernel
+from geometric_kernels.feature_maps.rejection_sampling import RejectionSamplingFeatureMapHyperbolic
+from geometric_kernels.frontends.gpytorch import GPyTorchGeometricKernel
+
 from HyperbolicEmbeddings.gplvm.gplvm_models import ExactGPLVM
-from HyperbolicEmbeddings.kernels.kernels_hyperbolic import HyperbolicRiemannianGaussianKernel
+from HyperbolicEmbeddings.kernels.kernels_hyperbolic import HyperbolicRiemannianGaussianKernel, LorentzGaussianKernel
 from HyperbolicEmbeddings.hyperbolic_distributions.hyperbolic_wrapped_normal import LorentzWrappedNormal, \
     LorentzWrappedNormalPrior
 from HyperbolicEmbeddings.hyperbolic_gplvm.hyperbolic_latent_variable import HyperbolicBackConstraintsLatentVariable, \
@@ -42,7 +48,7 @@ class HyperbolicExactGPLVM(ExactGPLVM):
 
     """
     def __init__(self, X: LatentVariable, data: torch.Tensor, latent_dim: int,
-                 kernel_lengthscale_prior: Prior = None, kernel_outputscale_prior: Prior = None, batch_params=True):
+                 kernel_lengthscale_prior: Prior = None, kernel_outputscale_prior: Prior = None, batch_params=True, kernel_type="SlowHyperbolic"):
         """
         Initialization.
 
@@ -55,6 +61,11 @@ class HyperbolicExactGPLVM(ExactGPLVM):
         -------------------
         :param kernel_lengthscale_prior: prior on the lengthscale parameter of the hyperbolic kernel
         :param kernel_outputscale_prior: prior on the scale parameter of the hyperbolic kernel
+        :param batch_params: batch dimension, either dimension of the Euclidean observations space R^D or torch.Size()
+        :kernel_type: 
+            "FastHyperbolic": use LorentzGaussianKernel. This is our new implementation, which we use to compute pullback metric and to train our models faster.
+            "SlowHyperbolic": use HyperbolicRiemannianGaussianKernel. This is our old implementation, with which we trained the model of our ICML paper.
+            "GeometricKernel": only with latent_dim=2, use the rejection sampling kernel from geometric_kernels
         """
         data_dim = data.shape[1]
         n = data.shape[0]
@@ -71,10 +82,32 @@ class HyperbolicExactGPLVM(ExactGPLVM):
         # Model parameters
         # Kernel (acting on latent dimensions)
         mean_module = ZeroMean(batch_shape=self.batch_shape)
-        covar_module = ScaleKernel(HyperbolicRiemannianGaussianKernel(latent_dim, nb_points_integral=3000,
-                                                                      lengthscale_prior=kernel_lengthscale_prior,
-                                                                      batch_shape=self.batch_shape),
-                                   outputscale_prior=kernel_outputscale_prior)
+        if kernel_type == "FastHyperbolic":
+            covar_module = ScaleKernel(LorentzGaussianKernel(dim=latent_dim, 
+                                                            nb_points_integral=3000,
+                                                            lengthscale_prior=kernel_lengthscale_prior, batch_shape=self.batch_shape), outputscale_prior=kernel_outputscale_prior)
+            
+        elif kernel_type == "SlowHyperbolic":
+            covar_module = ScaleKernel(HyperbolicRiemannianGaussianKernel(latent_dim, nb_points_integral=3000,
+                                                                        lengthscale_prior=kernel_lengthscale_prior,
+                                                                        batch_shape=self.batch_shape),
+                                    outputscale_prior=kernel_outputscale_prior)
+        
+        elif kernel_type == "GeometricKernel":
+            if latent_dim==2:
+                print('Using rejection sampling hyperbolic kernel')
+                hyperboloid = Hyperbolic(dim=latent_dim)
+                feature_map_rs = RejectionSamplingFeatureMapHyperbolic(hyperboloid, num_random_phases=3000, shifted_laplacian=False)
+                kernel_rs = MaternFeatureMapKernel(hyperboloid, feature_map_rs, torch.Generator())  # torch.Generator('cuda' if cuda else None)
+                base_kernel = GPyTorchGeometricKernel(kernel_rs)
+                base_kernel.nu = torch.inf
+                covar_module = ScaleKernel(base_kernel=base_kernel, outputscale_prior=kernel_outputscale_prior)
+                # base_kernel.raw_nu_constraint = Positive()
+            else:
+                raise NotImplementedError
+
+        else:
+            raise NotImplementedError
 
         super().__init__(X, data.T, likelihood, mean_module, covar_module)
 

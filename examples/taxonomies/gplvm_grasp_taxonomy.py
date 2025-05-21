@@ -200,7 +200,7 @@ if __name__ == '__main__':
     parser.add_argument("--loss_scale", dest="loss_scale", type=float, default=3000.0,
                         help="Set the loss scale.")
     parser.add_argument("--load_on", dest="load_on", type=bool, default=False,
-                        help="If True, generate plots.")
+                        help="If True, load exisiting model.")
     parser.add_argument("--plot_on", dest="plot_on", type=bool, default=True,
                         help="If True, generate plots.")
 

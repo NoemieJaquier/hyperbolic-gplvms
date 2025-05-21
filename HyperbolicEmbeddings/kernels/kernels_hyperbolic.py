@@ -2,6 +2,9 @@ import torch
 import gpytorch
 
 from HyperbolicEmbeddings.hyperbolic_manifold.lorentz_functions_torch import lorentz_distance_torch, lorentz_to_poincare
+from HyperbolicEmbeddings.kernels.utils_kernel_hyperbolic_2d import get_normalization_factor, get_phi, get_pms_factor, get_random_samples_lorentz_kernel_2D
+import HyperbolicEmbeddings.hyperbolic_manifold.poincare as poincare
+import HyperbolicEmbeddings.hyperbolic_manifold.lorentz as lorentz
 
 # if torch.cuda.is_available():
 #     device = torch.cuda.current_device()
@@ -9,6 +12,138 @@ from HyperbolicEmbeddings.hyperbolic_manifold.lorentz_functions_torch import lor
 #     device = 'cpu'
 device = 'cpu'
 
+
+class LorentzGaussianKernel(gpytorch.kernels.Kernel):
+    """
+    Instances of this class represent a Gaussian (RBF) covariance matrix between input points on the hyperbolic manifold.
+
+    This class is a faster version of the HyperbolicRiemannianGaussianKernel below. Both kernels are exactly identical if resample=True in HyperbolicRiemannianGaussianKernel.  
+
+    Attributes
+    ----------
+    self.dim, dimension of the hyperbolic H^n on which the data handled by the kernel are living
+    self.nb_points_integral, number of points used to compute the integral for the 2D heat kernel
+
+    Methods
+    -------
+    forward(point1_in_hyperbolic, point2_in_hyperbolic, diagonal_matrix_flag=False, **params)
+    forward_dim1(point1_in_hyperbolic, point2_in_hyperbolic, diagonal_matrix_flag=False, **params)
+    forward_dim2(point1_in_hyperbolic, point2_in_hyperbolic, diagonal_matrix_flag=False, **params)
+    forward_dim3(point1_in_hyperbolic, point2_in_hyperbolic, diagonal_matrix_flag=False, **params)
+
+    Static methods
+    --------------
+    """
+    def __init__(self, dim: int, batch_shape: torch.Size = torch.Size([]), nb_points_integral=1000, **kwargs) -> None:
+        """
+        Parameters
+        -
+        dim: dimension of the hyperbolic manifold. Currently, only dim=1, 2, or 3 are supported.
+        nb_points_integral: number of samples used for the Monte Carlo approximation in the 2D case, i.e., only relevant for dim=2
+        """
+        self.has_lengthscale = True
+        super(LorentzGaussianKernel, self).__init__(ard_num_dims=None, batch_shape=batch_shape, **kwargs)
+        self.dim = dim
+        self.nb_points_integral = nb_points_integral
+        self.samples_circle, self.samples_std_gaussian = get_random_samples_lorentz_kernel_2D(self.nb_points_integral)
+
+    def lorentz_kernel_1D(self, X: torch.Tensor, Y: torch.Tensor, kappa: float, diag=False) -> torch.Tensor:
+        """
+        Parameters
+        -
+        X: [N, 2] points on the Lorentz Model
+        Y: [M, 2] points on the Lorentz Model
+        tau:   outputscale of the kernel
+        kappa: lengthscale of the kernel
+        diag:     whether to return the diagonal or the whole kernel matrix
+
+        Returns
+        -------
+        kernel: [N, M] if not diag else [N]
+        """
+        distance_squared = lorentz.distance_squared(X, Y, diag=diag)
+        return torch.exp(- distance_squared / kappa)
+
+
+    def lorentz_kernel_2D(self, X: torch.Tensor, Y: torch.Tensor, samples_circle: torch.Tensor, samples_trunc_gaussian: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        -
+        X: [N, 3]   points on the lorentz manifold
+        Y: [M, 3]   points on the lorentz manifold
+        tau: [1]    scalar outputscale
+        samples_circle: [N_samples, 2] samples from the unit circle 
+        samples_trunc_gaussian: [N_samples] samples from a truncated gaussian distribution. dependent on lengthscale
+
+        Returns
+        kernel: [N, M]
+        """
+        X_poincare = poincare.from_lorentz(X)  # [N, 2]
+        Y_poincare = poincare.from_lorentz(Y)  # [M, 2]
+
+        outer_product_X = poincare.outer_product(X_poincare, samples_circle)  # [N, L]
+        outer_product_Y = poincare.outer_product(Y_poincare, samples_circle)  # [M, L]
+        phi_X = get_phi(outer_product_X, samples_trunc_gaussian)  # [N, L]
+        phi_Y = get_phi(outer_product_Y, samples_trunc_gaussian)  # [M, L]
+        pms_factor = get_pms_factor(samples_trunc_gaussian).unsqueeze(0)  # [1, L]
+        normalization_factor = get_normalization_factor(X_poincare[0], samples_circle, pms_factor)  # [1]
+        outer_product = (pms_factor * phi_X) @ phi_Y.conj().T   # [N, M]
+        return normalization_factor * outer_product.real
+
+
+    def lorentz_kernel_3D(self, X: torch.Tensor, Y: torch.Tensor, kappa: float, diag=False) -> torch.Tensor:
+        """
+        Parameters
+        -
+        X: [N, 4] points on the Lorentz Model
+        Y: [M, 4] points on the Lorentz Model
+        diag:     whether to return the diagonal or the whole kernel matrix
+
+        Returns
+        -------
+        kernel: [N, M] if not diag else [N]
+        """
+        distance = lorentz.distance(X, Y, diag)  # [N, M] or [N]
+        base_kernel = torch.exp(-distance**2 / kappa)  # [N, M] or [N]
+        scalar_factors = distance / torch.sinh(distance)  # [N, M] or [N]
+        scalar_factors = torch.where(torch.isnan(scalar_factors), 1., scalar_factors)  # [N, M] or [N]
+        return scalar_factors * base_kernel
+
+
+    def forward(self, X, Y, diag=False, **_) -> torch.Tensor:
+        """
+        Parameters
+        -
+        X: [N, D] points on the Lorentz Model
+        Y: [M, D] points on the Lorentz Model
+        diag:     whether to return the diagonal or the whole kernel matrix
+
+        Returns
+        -
+        kernel: [N, M] if not diag else [N]
+        """
+        output_shape = None
+        if len(X.shape) == 3:
+            output_shape = X.shape[0]
+            X = X[0]
+            Y = Y[0]
+
+        if self.dim == 1:
+            kernel = self.lorentz_kernel_1D(X, Y, 2*self.lengthscale**2, diag)
+        elif self.dim == 2:
+            samples_trunc_gaussian = torch.abs(self.samples_std_gaussian / self.lengthscale.squeeze())
+            kernel = self.lorentz_kernel_2D(X, Y, self.samples_circle, samples_trunc_gaussian)
+            if diag:
+                kernel = kernel[torch.eye(X.shape[0], dtype=torch.bool)]  # TODO: properly add diag flag for lorentz_heat_kernel_2D function
+        elif self.dim == 3:
+            kernel = self.lorentz_kernel_3D(X, Y, 2*self.lengthscale**2, diag)
+        else:
+            raise NotImplementedError
+
+        if output_shape is not None and self.batch_shape == torch.Size():
+            kernel = kernel.repeat(output_shape, 1, 1)
+        return kernel.squeeze() if diag else kernel
+    
 
 class HyperbolicRiemannianGaussianKernel(gpytorch.kernels.Kernel):
     """
@@ -30,7 +165,7 @@ class HyperbolicRiemannianGaussianKernel(gpytorch.kernels.Kernel):
     Static methods
     --------------
     """
-    def __init__(self, dim, nb_points_integral=1000, **kwargs):
+    def __init__(self, dim, nb_points_integral=1000, resample=True, **kwargs):
         """
         Initialisation.
 
@@ -41,6 +176,9 @@ class HyperbolicRiemannianGaussianKernel(gpytorch.kernels.Kernel):
         Optional parameters
         -------------------
         :param nb_points_integral: number of points used to compute the integral for the heat kernel
+        :param resample: use new samples at each call of the function
+                         We used "True" for training the models of our ICML paper.
+                         "False" makes the kernel identical to LorentzGaussianKernel above.
         :param kwargs: additional arguments
         """
         self.has_lengthscale = True
@@ -51,6 +189,13 @@ class HyperbolicRiemannianGaussianKernel(gpytorch.kernels.Kernel):
 
         # Number of points for the integral computation
         self.nb_points_integral = nb_points_integral
+
+        # New samples at each forward call? 
+        self.resample = resample
+
+        if not self.resample and self.dim == 2:
+            # Draw samples
+            self.samples_circle, self.samples_std_gaussian = get_random_samples_lorentz_kernel_2D(self.nb_points_integral)
 
     def forward_dim1(self, x1, x2):
         """
@@ -77,41 +222,6 @@ class HyperbolicRiemannianGaussianKernel(gpytorch.kernels.Kernel):
 
         return kernel
 
-    def inner_product(self, x1, x2, diag=False):
-        """
-        Computes the inner product between points in the hyperbolic manifold (Poincaré ball representation) as
-        <z, b> = \frac{1}{2}\log\frac{1-|z|^2}{|z-b|^2}
-
-        Parameters
-        ----------
-        :param x1: input points on the hyperbolic manifold
-        :param x2: input points on the hyperbolic manifold
-
-        Optional parameters
-        -------------------
-        :param diag: Should we return the matrix, or just the diagonal? If True, we must have `x1 == x2`
-
-        Returns
-        -------
-        :return: inner product matrix between x1 and x2
-        """
-        if diag is False:
-            # Expand dimensions to compute all vector-vector distances
-            x1 = x1.unsqueeze(-2)
-            x2 = x2.unsqueeze(-3)
-
-            # Repeat x and y data along -2 and -3 dimensions to have b1 x ... x ndata_x x ndata_y x dim arrays
-            x1 = torch.cat(x2.shape[-2] * [x1], dim=-2)
-            x2 = torch.cat(x1.shape[-3] * [x2], dim=-3)
-
-        # Difference between x1 and x2
-        diff_x = x1 - x2
-
-        # Inner product
-        inner_product = 0.5 * torch.log((1. - torch.norm(x1, dim=-1)**2) / torch.norm(diff_x, dim=-1)**2)
-
-        return inner_product
-
     def forward_dim2(self, x1, x2):
         """
         Computes the Gaussian kernel matrix between inputs x1 and x2 belonging to a hyperbolic manifold H^2 following:
@@ -130,10 +240,6 @@ class HyperbolicRiemannianGaussianKernel(gpytorch.kernels.Kernel):
         :param x1: input points on the hyperbolic manifold
         :param x2: input points on the hyperbolic manifold
 
-        Optional parameters
-        -------------------
-        :param diag: Should we return the whole kernel matrix, or just the diagonal? If True, we must have `x1 == x2`
-
         Returns
         -------
         :return: kernel matrix between x1 and x2
@@ -143,37 +249,38 @@ class HyperbolicRiemannianGaussianKernel(gpytorch.kernels.Kernel):
         x1_p = lorentz_to_poincare(x1)
         x2_p = lorentz_to_poincare(x2)
 
+        if self.resample:
+            # Draw samples
+            self.samples_circle, self.samples_std_gaussian = get_random_samples_lorentz_kernel_2D(self.nb_points_integral)
+
         # Sample b uniformly on S1
-        angle_samples = 2. * torch.pi * torch.rand(self.nb_points_integral)
-        bns = torch.cat((torch.cos(angle_samples)[:, None], torch.sin(angle_samples)[:, None]), -1).to(device)
+        bns = self.samples_circle
 
         # Sample p - Getting samples from truncated normal distribution
-        pms = torch.abs(torch.randn(self.nb_points_integral, requires_grad=False, device=device)
-                        * (1. / self.lengthscale)).squeeze().to(device)
+        samples_trunc_gaussian = torch.abs(self.samples_std_gaussian / self.lengthscale).squeeze().to(device)
 
         # Compute phi_l coefficient and factor of the sum over pms
-        phi_l_coefficient = (2j * pms + 1.).unsqueeze(-2).unsqueeze(-2)
-        pms_factor = (pms * torch.tanh(torch.pi * pms)).unsqueeze(-2).unsqueeze(-2)
+        pms_factor = get_pms_factor(samples_trunc_gaussian).unsqueeze(-2).unsqueeze(-2)
 
-        # ## Batch computation
-        # Compute inner product and expand dimensions to compute all vector-vector operations
-        inner_product_x1 = self.inner_product(x1_p, bns).unsqueeze(-2)
-        inner_product_x2 = self.inner_product(x2_p, bns).unsqueeze(-3)
-        # Repeat data along -2 and -3 dimensions to have b1 x ... x ndata_x x ndata_y x dim arrays
-        inner_product_x1 = torch.cat(inner_product_x2.shape[-2] * [inner_product_x1], dim=-2)
-        inner_product_x2 = torch.cat(inner_product_x1.shape[-3] * [inner_product_x2], dim=-3)
-
-        # Compute terms of the inner sum over b: we here use one sample on the circle for each element of the outer sum
-        exponential_x1p = torch.exp(phi_l_coefficient * inner_product_x1)
-        exponential_x2p = torch.exp(phi_l_coefficient * inner_product_x2)
-        phi_l = exponential_x1p * torch.conj(exponential_x2p)
+        outer_product_x1 = poincare.outer_product(x1_p, bns)
+        outer_product_x2 = poincare.outer_product(x2_p, bns)
+        phi_x1 = get_phi(outer_product_x1, samples_trunc_gaussian).unsqueeze(-2)
+        phi_x2 = get_phi(outer_product_x2, samples_trunc_gaussian).unsqueeze(-3)
+        phi_x1_extended = torch.cat(phi_x2.shape[-2] * [phi_x1], dim=-2)
+        phi_x2_extended = torch.cat(phi_x1.shape[-3] * [phi_x2], dim=-3)
+        phi_l = phi_x1_extended * torch.conj(phi_x2_extended)
 
         # Compute heat kernel ~ outer sum over p
-        outer_sum = torch.sum(pms_factor * phi_l, -1) / self.nb_points_integral
+        outer_sum = torch.sum(pms_factor * phi_l, -1) # / self.nb_points_integral
 
         # With normalization factor
-        phi_l_normal = exponential_x1p[..., 0, 0, :] * torch.conj(exponential_x1p[..., 0, 0, :])
-        normalization_factor = 1. / (torch.sum(pms_factor[..., 0, 0, :] * phi_l_normal, -1) / self.nb_points_integral)
+        phi_l_normal = phi_x1_extended[..., 0, 0, :] * torch.conj(phi_x2_extended[..., 0, 0, :])
+
+        if self.resample:
+            normalization_factor = 1. / (torch.sum(pms_factor[..., 0, 0, :] * phi_l_normal, -1))
+            # normalization_factor = 1. / (torch.sum(pms_factor[..., 0, 0, :] * phi_l_normal, -1) / self.nb_points_integral)
+        else:
+            normalization_factor = get_normalization_factor(x1[0], self.samples_circle, pms_factor)
         normalization_factor = normalization_factor.unsqueeze(-1).unsqueeze(-1)
 
         kernel = normalization_factor * outer_sum

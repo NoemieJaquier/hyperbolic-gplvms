@@ -6,13 +6,16 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, 
 from collections import OrderedDict
 from abc import ABC, abstractmethod
 from inspect import signature
+import logging
 
+import math
 import numpy as np
 import torch
 from torch import Tensor
 from torch.nn import Module
 from torch.optim.adam import Adam
 from torch.optim.optimizer import Optimizer
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from gpytorch import settings as gpt_settings
 from gpytorch.mlls.marginal_log_likelihood import MarginalLogLikelihood
 from gpytorch.mlls.exact_marginal_log_likelihood import ExactMarginalLogLikelihood
@@ -23,6 +26,7 @@ from scipy.optimize import Bounds, minimize
 from geoopt.optim import RiemannianAdam, RiemannianSGD
 
 from HyperbolicEmbeddings.utils.numpy_gpytorch_converter import module_to_array, set_params_with_array, TorchAttr
+from HyperbolicEmbeddings.hyperbolic_manifold.math_ops_hyperbolic import clamp
 
 
 """
@@ -123,6 +127,16 @@ def _get_extra_mll_args(
     return []
 
 
+def get_transformed_parameters(mll: MarginalLogLikelihood) -> dict[str, np.ndarray]:
+    parameters = {}
+    for raw_name, raw_param in mll.named_parameters():
+        constraint = mll.constraint_for_parameter_name(raw_name)
+        param = constraint.transform(raw_param) if constraint else raw_param
+        name = raw_name.replace('raw_', '')
+        parameters[name] = param.cpu().detach().squeeze().numpy()
+    return parameters
+
+
 def _handle_numerical_errors(
     error: RuntimeError, x: np.ndarray
 ) -> Tuple[float, np.ndarray]:
@@ -168,6 +182,51 @@ class StoppingCriterion(ABC):
         """
         pass  # pragma: no cover
 
+
+class VanillaStoppingCriterion(StoppingCriterion):
+    r"""
+    Stopping criterion that raises the boolean flag after a defined number of training iterations have passed. This
+    should resemble the vanilla implementation of a stopping criterion for any optimization algorithm. Performs an
+    internal computation of the number of times this function has been called, and raises the stop flag if this
+    number exceeds the parameter 'maxiter' that is passed when calling fit_gplvm_torch.
+
+    """
+    def __init__(self, maxiter: int = 10000) -> None:
+        r"""
+        Initialising the vanilla stopping criterion
+
+        Parameters
+        ----------
+        maxiter : Optional[int]
+            maximum number of iterations. (default: 10000)
+
+        """
+        self.maxiter = maxiter
+        self.iter = 0
+
+    def evaluate(self) -> bool:
+        r"""
+        Evaluate the stopping criterion.
+
+        Returns
+        -------
+        bool
+            stopping indicator that stops the optimization if true
+
+        Note
+        ----
+        (1) Since this vanilla implementation does not require the loss for computation, no parameter needs to be
+            passed into its signature when the evaluate method is called
+
+        """
+
+        # Stop the optimization if the maximum number of iterations is reached
+        self.iter += 1
+        if self.iter == self.maxiter:
+            return True
+
+        return False
+    
 
 class ExpMAStoppingCriterion(StoppingCriterion):
     r"""Exponential moving average stopping criterion.
@@ -511,3 +570,217 @@ def fit_gplvm_torch(
     return mll, info_dict
 
 
+def fit_gplvm_torch_with_logger(
+        mll: MarginalLogLikelihood, 
+        bounds: Optional[ParameterBounds] = None, 
+        optimizer_cls: Optimizer = Adam,
+        lr_scheduler: torch.optim.lr_scheduler = None, 
+        stop_criterion : StoppingCriterion = VanillaStoppingCriterion,
+        options: Optional[Dict[str, Any]] = None, 
+        lr_options: Optional[Dict[str, Any]] = None,
+        stop_crit_options: Optional[Dict[str, Any]] = None,
+        alt_opt_options: Optional[Dict[str, Any]] = None, 
+        logger: Logger = None) \
+        -> MarginalLogLikelihood:
+    r"""
+    Fit a GPLVM model by maximizing MLL with a torch optimizer. This function was adapted from the function
+    botorch.optim.fit.fit_gpytorch_torch of botorch to optimize Bayesian GPLVMs instead of gpytorch GP models.
+
+    The model and likelihood in the MLL must already be in train mode. Note that this method requires that the model has
+    `train_inputs` and `train_targets`.
+
+    Parameters
+    ----------
+    mll : MarginalLogLikelihood
+        the marginal log likelihood to be maximized.
+    model : gpytorch.models.ExactGP
+        the Riemannian GPLVM model
+    manifold : Manifold_VCurvature
+        the instantiated manifold that defines the latent space
+    bounds : Optional[ParameterBounds]
+        a ParameterBounds dictionary mapping parameter names to tuples of lower and upper bounds. Bounds specified here
+        take precedence over bounds on the same parameters specified in the constraints registered with the module.
+        (default: None)
+    optimizer_cls : Optional[Optimizer]
+        torch optimizer to use. Must not require a closure. (default: Adam)
+    lr_scheduler : Optional[torch.optim.lr_scheduler]
+        learning rate scheduler that changes the learning rate depending on the condition. Currently only supports
+        ReduceLROnPlateau as scheduler that can be instantiated within the optimisation script. (default: None)
+    stop_criterion : Optional[StoppingCriterion]
+        stopping criterion to be used. Currently only the vanilla version and the exponential moving average is
+        supported. (default: VanillaStoppingCriterion)
+    options :  Optional[Dict[str, Any]]
+        options for model fitting. Relevant options will be passed to the `optimizer_cls`. Additionally, options can
+        include: "disp" to specify whether to display model fitting diagnostics and "maxiter" to specify the maximum
+        number of iterations. (default: {"maxiter": 1000, "disp": True, "lr": 0.05})
+    lr_options : Optional[Dict[str, Any]]
+        options for learning rate scheduler. Relevant options will be passed to the 'lr_scheduler'. Additionally, options
+        can include: "mode" to specify if the monitored quantity should decrease or increase, "verbose" to specify if
+        information should be printed onto the console if changes to the learning rate is made. (default: {"mode": min,
+        "verbose": True})
+    stop_crit_options : Optional[Dict[str, Any]]
+        options for the stopping criterion. Relevant options will be passed to the 'stop_criterion'. (default: None)
+    alt_opt_options : Optional[Dict[str, Any]]
+        options for curvature fitting. Relevant options will be passed to the Euclidean optimizer that is used to
+        optimize the curvature value of the manifold. Options can include: "lr" to specify the learning rate, "opti_split"
+        to specify the split between the Riemannian and Euclidean optimisation. (default: {"lr": 0.001,
+        "opti_split": (50,20)}
+    logger : Optional[Logger]
+        variable to store the logger that logs all relevant information from training. (default: None)
+
+    Returns
+    -------
+    MarginalLogLikelihood
+        MLL with parameters optimized in-place
+
+    Example
+    -------
+        >>> mll = VariationalELBO(likelihood, gplvm_model, num_data=num_data)
+        >>> mll.train()
+        >>> fit_gpytorch_torch(mll, model)
+        >>> mll.eval()
+
+    Note
+    ----
+    (1) We differentiate between two optimizers, the Riemannian optimizer (R_optimizer) and the Euclidean optimizer
+        (E_optimizer). The former will optimize the common parameters in GPHLVM, i.e. likelihood.noise_covar.raw_noise,
+        model.X.X, model.covar_module.raw_outputscale, model.covar_module.base_kernel.raw_lengthscale. The latter will
+        optimize exclusively the manifold curvature. Both optimizers will operate in an alternating fashion.     (08.03)
+
+    """
+    # Retrieve the parameters for the optimiser(s) and print parameters before training to check
+    exclude = options.pop("exclude", None)
+    if exclude is not None:
+        model_param = [
+            t for p_name, t in mll.named_parameters() if p_name not in exclude
+        ]
+    else:
+        model_param = list(mll.parameters())
+
+    # Set default optimisation options and update them if the input 'options' is not None
+    optim_options = {"maxiter": 1000, "disp": True, "lr": 0.05}
+    optim_options.update(options or {})
+
+    # Set default learning rate scheduler options and update them if the input 'lr_options' is not None
+    scheduler_options = {"mode": 'min', "verbose": True}
+    scheduler_options.update(lr_options or {})
+
+    # Set default stopping criterion options and update them if the input 'stop_crtierion_options' is not None
+    stop_criterion_options = {"maxiter": 1000}
+    stop_criterion_options.update(stop_crit_options or {})
+
+    # Initialise the Riemannian optimizer
+    if optimizer_cls == RiemannianAdam:
+        optimizer = optimizer_cls(params=[{"params": model_param}], **_filter_kwargs(torch.optim.Adam, **optim_options))
+    elif optimizer_cls == RiemannianSGD:
+        optimizer = optimizer_cls(params=[{"params": model_param}], **_filter_kwargs(torch.optim.SGD, **optim_options))
+    else:
+        optimizer = optimizer_cls(params=[{"params": model_param}], **_filter_kwargs(optimizer_cls, **optim_options))
+
+    # Initialise scheduler
+    if lr_scheduler == ReduceLROnPlateau:
+        scheduler = lr_scheduler(optimizer=optimizer, **_filter_kwargs(ReduceLROnPlateau, **scheduler_options))
+    elif lr_scheduler is not None:
+        scheduler = lr_scheduler(optimizer=optimizer, **_filter_kwargs(lr_scheduler, **scheduler_options))
+
+    # Initialise the stopping criterion
+    if stop_criterion == VanillaStoppingCriterion:
+        stopping_criterion = VanillaStoppingCriterion(**_filter_kwargs(VanillaStoppingCriterion, **stop_criterion_options))
+    elif stop_criterion == ExpMAStoppingCriterion:
+        stopping_criterion = ExpMAStoppingCriterion(**_filter_kwargs(ExpMAStoppingCriterion, **stop_criterion_options))
+    else:
+        stopping_criterion = stop_criterion(**_filter_kwargs(StoppingCriterion, **stop_criterion_options))
+
+    # Get bounds specified for each parameter in model (if any)
+    bounds_ = {}                                                          # Initialise an empty dictionary that follows the structure of ParameterBounds
+    if hasattr(mll, "named_parameters_and_constraints"):                  # Enter existing model parameter constrains into the bounds_ dictionary
+        for param_name, _, constraint in mll.named_parameters_and_constraints():
+            if constraint is not None and not constraint.enforced:
+                bounds_[param_name] = constraint.lower_bound, constraint.upper_bound
+    if bounds is not None:                                                # Update with user-supplied bounds (overwrites if already exists)
+        bounds_.update(bounds)
+
+    def compute_loss(train_inputs) -> Tensor:
+        # Compute the Gaussian Process prior by giving the training inputs to the Riemannian GPLVM model
+        output = mll.model(train_inputs)
+
+        # Compute the loss of the model, which is defined here as the negative of the marginal log likelihood
+        train_targets = mll.model.train_targets
+        args = [output, train_targets] + _get_extra_mll_args(mll)
+        # computed_loss = -mll(*args)
+        computed_loss = -mll(*args).sum()
+        return computed_loss
+
+    # Initialise training relevant variables
+    i = 0
+    stop = False
+
+    while not stop:
+        # Retrieve training inputs from models
+        if hasattr(mll.model.train_inputs, '__call__'):
+            # For variational GPLVMs, the training inputs are sampled at each iteration
+            # For back-constrained GPLVMs, the training inputs are computed as a function of the training targets
+            train_inputs = mll.model.train_inputs()
+        else:
+            # For exact GPLVMs, the training inputs are fixed
+            train_inputs = mll.model.train_inputs[0]
+
+        optimizer.zero_grad()
+        loss = compute_loss(train_inputs)
+
+        # Log information onto the logger
+        if logger:
+            logger.log(step=i, n_steps=optim_options["maxiter"], loss=loss.item(),
+                        X=train_inputs.cpu().detach().numpy(), parameters=get_transformed_parameters(mll),
+                        state_dict=mll.state_dict(), mll=mll)
+
+        # Print information on current backward pass onto the console
+        if optim_options["disp"] and ((i + 1) % 1 == 0 or i == (optim_options["maxiter"] - 1)):
+            print(f"Iter {i + 1}/{optim_options['maxiter']}: {loss.item():.5f}")
+
+        # Call the scheduler
+        if lr_scheduler is not None:
+            scheduler.step(loss.detach())
+
+        i += 1
+        # Evaluate the stopping criterion
+        if stop_criterion == VanillaStoppingCriterion:
+            stop = stopping_criterion.evaluate()
+        else:
+            stop = stopping_criterion.evaluate(fvals=loss.detach())
+        if stop:
+            break
+
+        # Compute the backward step w.r.t. the loss and update the optimiser
+        loss.backward(retain_graph=False)  # Back propagation
+
+        # Carry out an optimization step
+        optimizer.step()  # Gradient descent
+
+        # Project the parameters onto bounds
+        if bounds_:
+            for pname, param in mll.named_parameters():
+                if pname in bounds_:
+                    param_old = param.item()
+                    param_new = clamp(param, *bounds_[pname])
+                    if not math.isclose(param_old, param_new.item()):
+                        logging.info(f"The parameter {pname} was clamped from {param_old:.4f} to the specified boundary of {param_new}")
+                    param.data = param_new  # Overwrite the parameter value
+
+        del loss
+
+    # Compute final loss after optimisation has been stopped. Save information in logger and info_dict
+    if hasattr(mll.model.train_inputs, '__call__'):
+        # For variational GPLVMs, the training inputs are sampled at each iteration
+        # For back-constrained GPLVMs, the training inputs are computed as a function of the training targets
+        train_inputs = mll.model.train_inputs()
+    else:
+        # For exact GPLVMs, the training inputs are fixed
+        train_inputs = mll.model.train_inputs[0]
+    final_loss = compute_loss(train_inputs)
+    if logger:
+        logger.log(step=i, n_steps=optim_options["maxiter"], loss=final_loss.item(),
+                   X=train_inputs.cpu().detach().numpy(), parameters=get_transformed_parameters(mll),
+                   state_dict=mll.state_dict(), mll=mll)
+
+    return mll
